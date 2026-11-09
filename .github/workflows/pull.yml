@@ -1,0 +1,98 @@
+name: Pull day activity
+
+# Manual run only. Reads the heatmap section of adsb.lol's public daily archives for a date
+# range and publishes one small CSV per day (one row per US aircraft seen that day).
+on:
+  workflow_dispatch:
+    inputs:
+      start:
+        description: "First day, YYYY-MM-DD"
+        required: true
+      end:
+        description: "Last day, YYYY-MM-DD"
+        required: true
+      jobs:
+        description: "Parallel jobs (1-20)"
+        required: true
+        default: "20"
+      slices:
+        description: 'Half-hours of the UTC day to read: "all" or e.g. "24-47,0-5"'
+        required: true
+        default: "all"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      chunks: ${{ steps.split.outputs.chunks }}
+    steps:
+      - id: split
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import datetime as dt, json, os
+          start = dt.date.fromisoformat(os.environ["START"])
+          end = dt.date.fromisoformat(os.environ["END"])
+          jobs = max(1, min(20, int(os.environ["JOBS"])))
+          assert start <= end, "start must not be after end"
+          days = [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+          size = -(-len(days) // jobs)
+          chunks = [{"from": c[0], "to": c[-1]} for c in (days[i:i + size] for i in range(0, len(days), size))]
+          print("chunks=" + json.dumps(chunks))
+          PY
+
+  pull:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: ${{ fromJson(needs.plan.outputs.chunks) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Read ${{ matrix.chunk.from }} to ${{ matrix.chunk.to }}
+        env:
+          FROM: ${{ matrix.chunk.from }}
+          TO: ${{ matrix.chunk.to }}
+          SLICES: ${{ inputs.slices }}
+        run: python fetch_heatmap.py --from "$FROM" --to "$TO" --slices "$SLICES" --out out --workers 6
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: part-${{ matrix.chunk.from }}_${{ matrix.chunk.to }}
+          path: out/
+          if-no-files-found: warn
+          retention-days: 1
+
+  bundle:
+    needs: pull
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: days
+          pattern: part-*
+          merge-multiple: true
+      - name: Summary
+        run: |
+          n=$(ls days/adsb_day_*.csv.gz 2>/dev/null | wc -l)
+          echo "### $n days written, $(du -sh days | cut -f1) total" >> "$GITHUB_STEP_SUMMARY"
+          ls days | sed -n '1p;$p' >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adsb-day-activity_${{ inputs.start }}_${{ inputs.end }}
+          path: days/
+          compression-level: 0
+          retention-days: 30
