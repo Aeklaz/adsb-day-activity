@@ -3,8 +3,9 @@ ARCHIVE, reading only the heatmap section of each day's tar with HTTP range requ
 
 Why: the per-aircraft files (fetch_history.py) are a rolling 43 days. The bulk archive reaches
 back to 2023-02-16 but is up to ~3.4 GB a day with no index. About a quarter of it is `heatmap/`:
-48 half-hour files holding a position for every aircraft every 10 seconds. That answers, for any
-hex on any day: was it seen, for how long, airborne or on the ground, and where.
+48 half-hour files holding a position for every aircraft every 10 seconds (every 30 s before
+2023-08-02 07:30 UTC). That answers, for any hex on any day: was it seen, for how long, airborne
+or on the ground, and where.
 
 Stdlib only, no database: it writes one small CSV per day.
 
@@ -23,16 +24,21 @@ Assets: github.com/adsblol/globe_history_<year>/releases/download/<tag>/<tag>.ta
         for a header). tag = v<YYYY.MM.DD>-planes-readsb-<instance>.
 
 Heatmap record = 4 little-endian int32: [hex | flags, lat*1e6, lon*1e6, altitude/speed word]
-    upper byte of word 0 non-zero  -> time marker (0x0E7F7C9D, every 10 s) or non-ICAO address
-    lat >= 2^30                    -> callsign/type info record, not a position
-    low 16 bits of word 3          -> altitude / 25 ft, signed; -123 means on the ground
+(format per readsb globe_index.c, identical in every era checked, Feb 2023 - Nov 2026)
+    file start                     -> index, one entry per sample time, then the time markers
+    word 0 = 0x0E7F7C9D            -> time marker; its altitude field = sample interval in ms
+    bit 24 of word 0               -> non-ICAO address (skipped)
+    bits 27-31 of word 0           -> address type (ADS-R/UAT, TIS-B, MLAT ...), masked off
+    lat >= 2^30                    -> callsign/squawk info record, not a position
+    low 16 bits of word 3          -> altitude / 25 ft, signed; -123 on the ground, -124 unknown
 
 Output, one row per aircraft seen that day:
     hex, obs_date, points, airborne_points, slices, first_lat, first_lon, last_lat, last_lon
-    points x 10 s = time observed; `slices` is a bitmask of the half-hours it appeared in.
-The first line of each CSV is a `#key=value;...` comment recording the release tag and which
-half-hours were read, so an aircraft with no row means "not seen in the half-hours read",
-never simply "did not fly".
+    points x 10 s = time observed (a 30 s sample counts 3); `slices` is a bitmask of the
+    half-hours it appeared in.
+The first line of each CSV is a `#key=value;...` comment recording the release tag, which
+half-hours were read and the READER version, so an aircraft with no row means "not seen in the
+half-hours read", never simply "did not fly", and files from two readers are never mixed.
 
 Data: adsb.lol globe_history, (c) adsb.lol contributors, Open Database License (ODbL) 1.0.
 """
@@ -48,6 +54,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -55,8 +62,8 @@ log = logging.getLogger("heatmap")
 
 ASSET = "https://github.com/adsblol/globe_history_{year}/releases/download/{tag}/{tag}.tar{part}"
 PART_SUFFIXES = (".aa", ".ab", ".ac", ".ad", ".ae", ".af")
-# Tried in order; the first with a usable archive wins. prod-0 is the main aggregator and
-# staging-0 its twin; the rest are the names the same data was published under in other periods
+# Tried in order; the one holding the most half-hours wins (see fetch_day). prod-0 is the main
+# aggregator and staging-0 its twin; the rest are names the data was published under in other periods
 # (test-* Feb-Mar 2023, prod-1 Mar-Oct 2023, *tmp May-Jun 2025). mlatonly-0 is left out on
 # purpose: it holds MLAT positions only, so it would look like a day when almost nobody flew.
 INSTANCES = "prod-0,staging-0,prod-0tmp,staging-0tmp,prod-1,test-0,test-1"
@@ -64,10 +71,20 @@ HEATMAP_FILE = re.compile(r"\./heatmap/(\d\d)\.bin\.ttf")
 WALK_CHUNK = 32768  # bytes fetched per step when walking tar headers
 UA = "adsb-day-activity/0.1 (ODbL archive reader)"
 GROUND = 0xFF85  # -123 as an unsigned 16-bit value
+MARKER = 0x0E7F7C9D  # word 0 of a time marker
+SAMPLE_S = 10  # one point = 10 s observed; samples of a 30 s archive count 3 points each
+# Smaller heatmap files are outages, read as "not available": an index-only file is under 1 KB,
+# a real half-hour is megabytes even in the thinnest month (Feb 2023).
+MIN_SLICE_BYTES = 16384
 SIGNED_URL_TTL = 240  # GitHub's redirect target is signed for ~5 minutes
 COLUMNS = ("hex", "obs_date", "points", "airborne_points", "slices",
            "first_lat", "first_lon", "last_lat", "last_lon")
 CSV_NAME = "adsb_day_{day}.csv.gz"
+# Bump when a change alters the numbers in the CSV (not for speed or logging changes). Files from
+# different readers are not comparable: reader 1 dropped every ADS-R, TIS-B and MLAT position
+# (~8% of US aircraft, 16% of our sample) and counted 30 s samples as one point. load_heatmap.py
+# refuses a folder whose files are not all from this reader.
+READER = 2
 
 class NoRelease(RuntimeError):
     """No archive published for that day and instance."""
@@ -249,19 +266,36 @@ def locate_heatmap(ar: Archive) -> dict[int, tuple[int, int]]:
 
 def parse_slice(data: bytes, lo: int, hi: int, agg: dict[int, list], bit: int) -> None:
     """Fold one decompressed half-hour file into
-    agg[hex] = [points, airborne, slices, first_lat, first_lon, last_lat, last_lon]."""
+    agg[hex] = [points, airborne, slices, first_lat, first_lon, last_lat, last_lon].
+
+    The file opens with an index, one entry per sample time; its first entry holds the index's
+    own length, and right after it comes the first time marker, whose altitude field is the
+    sample interval in ms (30 000 until 2023-08-02 07:30 UTC, 10 000 since). Points are counted
+    in SAMPLE_S units so `points x 10 s` means the same in every era. ValueError if that header
+    is not there."""
     n = len(data) // 16 * 16
     u, s = memoryview(data)[:n].cast("I"), memoryview(data)[:n].cast("i")
-    for h, lat, lon, w in zip(u[0::4], s[1::4], s[2::4], u[3::4], strict=True):
-        if h & 0xFF000000 or not lo <= h <= hi or lat >= 1 << 30:
+    k = u[0] if n else 0
+    step = u[4 * k + 3] & 0xFFFF if 0 < k < len(u) // 4 and u[4 * k] == MARKER else 0
+    if not step or step % (SAMPLE_S * 1000):
+        raise ValueError(f"no time marker with a 10 s multiple interval after the index ({step})")
+    weight = step // (SAMPLE_S * 1000)
+    i = 4 * k
+    for h, lat, lon, w in zip(u[i::4], s[i + 1 :: 4], s[i + 2 :: 4], u[i + 3 :: 4], strict=True):
+        # Bits 24-26 set: a time marker or a non-ICAO address. Bits 27-31 are only the address
+        # type (ADS-R/UAT, TIS-B, MLAT ...) of a real ICAO address: masked off, not skipped.
+        if h & 0x07000000 or lat >= 1 << 30:
+            continue
+        h &= 0xFFFFFF
+        if not lo <= h <= hi:
             continue
         air = (w & 0xFFFF) != GROUND
         rec = agg.get(h)
         if rec is None:
-            agg[h] = [1, int(air), bit, lat, lon, lat, lon]
+            agg[h] = [weight, weight * air, bit, lat, lon, lat, lon]
         else:
-            rec[0] += 1
-            rec[1] += air
+            rec[0] += weight
+            rec[1] += weight * air
             rec[2] |= bit
             rec[5] = lat
             rec[6] = lon
@@ -269,28 +303,57 @@ def parse_slice(data: bytes, lo: int, hi: int, agg: dict[int, list], bit: int) -
 
 def fetch_day(day: dt.date, slices: list[int], *, instances: list[str], lo: int, hi: int,
               workers: int) -> tuple[dict, list[tuple]]:
-    """Read one day from the first instance with a usable archive. Returns (meta, rows) with rows
-    in COLUMNS order; writes nothing. NoRelease if no instance published that day."""
+    """Read one day from the instance holding the most heatmap data for the wanted half-hours.
+    Instances are looked at in order and the search stops at the first that has every wanted
+    half-hour, so a normal day costs one look. Returns (meta, rows) with rows in COLUMNS order;
+    writes nothing. NoRelease if no instance published that day.
+
+    Why not simply the first: on outage days one instance stops early while its twin carries the
+    whole day (2024-10-29: prod-0 37 of 48 half-hours, staging-0 all 48). Why bytes and not the
+    count: a half-hour cut short still counts as present (2026-05-05: staging-0 has 14 half-hours
+    in 167 MB, prod-0 13 in 235 MB).
+    """
+    t0 = time.monotonic()
+    best: tuple[int, Archive, dict[int, tuple[int, int]]] | None = None
+    seen: list[str] = []
     error: Exception | None = None
     for inst in instances:
         try:
-            return _read_archive(Archive(day, inst), day, slices, lo, hi, workers)
+            ar = Archive(day, inst)
+            members = locate_heatmap(ar)
         except NoRelease:
             continue
-        except Exception as e:  # broken or heatmap-less archive: the twin instance may be fine
-            log.warning("%s %s unusable (%s); trying the next instance", day, inst, e)
+        except Exception as e:  # broken or heatmap-less archive: another instance may be fine
+            log.warning("%s %s unusable (%s)", day, inst, e)
             error = e
-    if error:
-        raise error
-    raise NoRelease(f"{day}: none of {instances}")
+            continue
+        have = _available(members, slices)
+        size = sum(members[i][1] for i in have)
+        seen.append(f"{inst} {len(have)}/{len(slices)} in {size / 1e6:.0f} MB")
+        if best is None or size > best[0]:
+            best = (size, ar, members)
+        if len(have) == len(slices):
+            break
+    if best is None:
+        if error:
+            raise error
+        raise NoRelease(f"{day}: none of {instances}")
+    if len(seen) > 1 or len(_available(best[2], slices)) < len(slices):
+        log.info("%s half-hours available: %s -> using %s", day, ", ".join(seen), best[1].tag)
+    return _read_archive(best[1], best[2], day, slices, lo, hi, workers, t0)
 
 
-def _read_archive(ar: Archive, day: dt.date, slices: list[int], lo: int, hi: int,
-                  workers: int) -> tuple[dict, list[tuple]]:
-    t0 = time.monotonic()
-    members = locate_heatmap(ar)
+def _available(members: dict[int, tuple[int, int]], slices: list[int]) -> list[int]:
+    """The wanted half-hours whose heatmap file holds data. Outage days leave empty or
+    index-only files behind (2023-04-02: nine of 48 are 0 bytes in every instance)."""
+    return sorted(i for i in slices if members.get(i, (0, 0))[1] >= MIN_SLICE_BYTES)
+
+
+def _read_archive(ar: Archive, members: dict[int, tuple[int, int]], day: dt.date,
+                  slices: list[int], lo: int, hi: int, workers: int,
+                  t0: float) -> tuple[dict, list[tuple]]:
     t_locate = time.monotonic() - t0
-    want = sorted(i for i in slices if i in members)
+    want = _available(members, slices)
     agg: dict[int, list] = {}
     mask, t_parse = 0, 0.0
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -301,7 +364,14 @@ def _read_archive(ar: Archive, day: dt.date, slices: list[int], lo: int, hi: int
             blobs = list(pool.map(lambda i: ar.read(*members[i]), group))
             t1 = time.monotonic()
             for i, blob in zip(group, blobs, strict=True):
-                parse_slice(gzip.decompress(blob), lo, hi, agg, 1 << i)
+                try:
+                    data = gzip.decompress(blob)
+                    parse_slice(data, lo, hi, agg, 1 << i)
+                except (EOFError, OSError, zlib.error, ValueError) as e:
+                    # Files cut short by a crash (sizes at 4 KB page multiples, e.g. 2023-03-09
+                    # staging-0). parse_slice checks before it adds anything, so skipping is clean.
+                    log.warning("%s half-hour %02d unreadable (%s); left out", ar.tag, i, e)
+                    continue
                 mask |= 1 << i
             t_parse += time.monotonic() - t1
     rows = [
@@ -309,7 +379,7 @@ def _read_archive(ar: Archive, day: dt.date, slices: list[int], lo: int, hi: int
          round(r[3] / 1e6, 5), round(r[4] / 1e6, 5), round(r[5] / 1e6, 5), round(r[6] / 1e6, 5))
         for h, r in sorted(agg.items())
     ]
-    meta = {"tag": ar.tag, "mask": mask, "slices": len(want), "bytes": ar.bytes_read,
+    meta = {"tag": ar.tag, "mask": mask, "slices": mask.bit_count(), "bytes": ar.bytes_read,
             "seconds": time.monotonic() - t0, "locate_s": t_locate, "parse_s": t_parse}
     return meta, rows
 
@@ -322,7 +392,7 @@ def write_csv(outdir: Path, day: dt.date, meta: dict, rows: list[tuple]) -> Path
     tmp = path.with_name(path.name + ".tmp")
     with gzip.open(tmp, "wt", newline="", compresslevel=9) as f:
         f.write(f"#tag={meta['tag']};slices_fetched={meta['mask']};bytes={meta['bytes']};"
-                "source=adsb.lol globe_history (ODbL 1.0)\n")
+                f"reader={READER};source=adsb.lol globe_history (ODbL 1.0)\n")
         w = csv.writer(f)
         w.writerow(COLUMNS)
         w.writerows(rows)

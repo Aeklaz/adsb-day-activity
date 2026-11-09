@@ -7,10 +7,14 @@ on:
     inputs:
       start:
         description: "First day, YYYY-MM-DD"
-        required: true
+        required: false
       end:
         description: "Last day, YYYY-MM-DD"
-        required: true
+        required: false
+      dates:
+        description: "Instead of first/last: specific days, comma-separated"
+        required: false
+        default: ""
       jobs:
         description: "Parallel jobs (1-20)"
         required: true
@@ -28,27 +32,41 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       chunks: ${{ steps.split.outputs.chunks }}
+      days: ${{ steps.split.outputs.days }}
+      label: ${{ steps.split.outputs.label }}
     steps:
       - id: split
         env:
           START: ${{ inputs.start }}
           END: ${{ inputs.end }}
+          DATES: ${{ inputs.dates }}
           JOBS: ${{ inputs.jobs }}
         run: |
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import datetime as dt, json, os
-          start = dt.date.fromisoformat(os.environ["START"])
-          end = dt.date.fromisoformat(os.environ["END"])
           jobs = max(1, min(20, int(os.environ["JOBS"])))
-          assert start <= end, "start must not be after end"
-          days = [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+          listed = [d.strip() for d in os.environ["DATES"].split(",") if d.strip()]
+          if listed:
+              days = sorted({dt.date.fromisoformat(d).isoformat() for d in listed})
+              label = f"{days[0]}_{days[-1]}_{len(days)}-listed-days"
+          else:
+              assert os.environ["START"] and os.environ["END"], "give first and last day, or a list of days"
+              start = dt.date.fromisoformat(os.environ["START"])
+              end = dt.date.fromisoformat(os.environ["END"])
+              assert start <= end, "start must not be after end"
+              days = [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+              label = f"{days[0]}_{days[-1]}"
           size = -(-len(days) // jobs)
-          chunks = [{"from": c[0], "to": c[-1]} for c in (days[i:i + size] for i in range(0, len(days), size))]
+          chunks = [{"from": c[0], "to": c[-1], "dates": ",".join(c)}
+                    for c in (days[i:i + size] for i in range(0, len(days), size))]
           print("chunks=" + json.dumps(chunks))
+          print("days=" + ",".join(days))
+          print("label=" + label)
           PY
 
   pull:
     needs: plan
+    name: pull ${{ matrix.chunk.from }} to ${{ matrix.chunk.to }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     strategy:
@@ -63,10 +81,9 @@ jobs:
           python-version: "3.12"
       - name: Read ${{ matrix.chunk.from }} to ${{ matrix.chunk.to }}
         env:
-          FROM: ${{ matrix.chunk.from }}
-          TO: ${{ matrix.chunk.to }}
+          DATES: ${{ matrix.chunk.dates }}
           SLICES: ${{ inputs.slices }}
-        run: python fetch_heatmap.py --from "$FROM" --to "$TO" --slices "$SLICES" --out out --workers 6
+        run: python fetch_heatmap.py --dates "$DATES" --slices "$SLICES" --out out --workers 6
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -77,7 +94,7 @@ jobs:
           overwrite: true  # "Re-run failed jobs" uploads under the same name
 
   bundle:
-    needs: pull
+    needs: [plan, pull]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -88,13 +105,11 @@ jobs:
           merge-multiple: true
       - name: Summary
         env:
-          START: ${{ inputs.start }}
-          END: ${{ inputs.end }}
+          DAYS: ${{ needs.plan.outputs.days }}
         run: |
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
-          import datetime as dt, os, pathlib
-          start, end = (dt.date.fromisoformat(os.environ[k]) for k in ("START", "END"))
-          want = [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+          import os, pathlib
+          want = os.environ["DAYS"].split(",")
           files = list(pathlib.Path("days").glob("adsb_day_*.csv.gz"))
           have = {f.name[9:19] for f in files}
           missing = [d for d in want if d not in have]
@@ -104,7 +119,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@v4
         with:
-          name: adsb-day-activity_${{ inputs.start }}_${{ inputs.end }}
+          name: adsb-day-activity_${{ needs.plan.outputs.label }}
           path: days/
           compression-level: 0
           retention-days: 30
