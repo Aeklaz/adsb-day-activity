@@ -74,6 +74,7 @@ jobs:
           path: out/
           if-no-files-found: warn
           retention-days: 1
+          overwrite: true  # "Re-run failed jobs" uploads under the same name
 
   bundle:
     needs: pull
@@ -86,13 +87,25 @@ jobs:
           pattern: part-*
           merge-multiple: true
       - name: Summary
+        env:
+          START: ${{ inputs.start }}
+          END: ${{ inputs.end }}
         run: |
-          n=$(ls days/adsb_day_*.csv.gz 2>/dev/null | wc -l)
-          echo "### $n days written, $(du -sh days | cut -f1) total" >> "$GITHUB_STEP_SUMMARY"
-          ls days | sed -n '1p;$p' >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import datetime as dt, os, pathlib
+          start, end = (dt.date.fromisoformat(os.environ[k]) for k in ("START", "END"))
+          want = [(start + dt.timedelta(days=i)).isoformat() for i in range((end - start).days + 1)]
+          files = list(pathlib.Path("days").glob("adsb_day_*.csv.gz"))
+          have = {f.name[9:19] for f in files}
+          missing = [d for d in want if d not in have]
+          print(f"### {len(have)} of {len(want)} days written, {sum(f.stat().st_size for f in files) / 1e6:.0f} MB")
+          if missing:
+              print(f"\n{len(missing)} days missing: " + ", ".join(missing))
+          PY
       - uses: actions/upload-artifact@v4
         with:
           name: adsb-day-activity_${{ inputs.start }}_${{ inputs.end }}
           path: days/
           compression-level: 0
           retention-days: 30
+          overwrite: true

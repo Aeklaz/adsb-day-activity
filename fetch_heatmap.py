@@ -2,23 +2,25 @@
 ARCHIVE, reading only the heatmap section of each day's tar with HTTP range requests.
 
 Why: the per-aircraft files (fetch_history.py) are a rolling 43 days. The bulk archive reaches
-back to 2023-02-16 but is ~3.4 GB a day with no index. Its last ~0.8 GB is `heatmap/`: 48
-half-hour files holding a position for every aircraft every 10 seconds. That answers, for any hex
-on any day: was it seen, for how long, airborne or on the ground, and where.
+back to 2023-02-16 but is up to ~3.4 GB a day with no index. About a quarter of it is `heatmap/`:
+48 half-hour files holding a position for every aircraft every 10 seconds. That answers, for any
+hex on any day: was it seen, for how long, airborne or on the ground, and where.
 
 Stdlib only, no database: it writes one small CSV per day.
 
     python fetch_heatmap.py --from 2026-11-06 --to 2026-11-08 --out out
     python fetch_heatmap.py --dates 2026-11-07 --slices 40-41 --out out
 
-Archive layout (verified 2026-11-09 on v2026.11.07-planes-readsb-prod-0):
-    ./traces/xx/trace_full_<hex>.json      first ~76% of the bytes
-    ./acas/...   ./LICENSE-cc0.txt
+Archive layout (one tar per day and instance):
+    ./traces/xx/trace_full_<hex>.json      most of the bytes, hundreds of thousands of small files
     ./heatmap/NN.bin.ttf  x 48             gzip; NN = half-hour of the UTC day (00 = 00:00-00:30)
-    ./LICENSE-ODbL.txt   ./README.txt
-Assets: github.com/adsblol/globe_history_<year>/releases/download/<tag>/<tag>.tar.aa, .ab, ...
-        tag = v<YYYY.MM.DD>-planes-readsb-<instance>. Parts are 2,000,000,000 bytes, a multiple of
-        512, so tar block alignment survives the split and any offset can be probed for a header.
+    ./acas/...  ./README.txt  ./LICENSE-*.txt
+The ORDER of those top-level entries differs between eras of the archive (heatmap before the
+traces in mid-2023 and mid-2024, after them in 2026), so it is discovered, never assumed.
+Assets: github.com/adsblol/globe_history_<year>/releases/download/<tag>/<tag>.tar when the day is
+        under 2 GB, else split as <tag>.tar.aa, .tar.ab, ... in parts of 2,000,000,000 bytes (a
+        multiple of 512, so tar block alignment survives the split and any offset can be probed
+        for a header). tag = v<YYYY.MM.DD>-planes-readsb-<instance>.
 
 Heatmap record = 4 little-endian int32: [hex | flags, lat*1e6, lon*1e6, altitude/speed word]
     upper byte of word 0 non-zero  -> time marker (0x0E7F7C9D, every 10 s) or non-ICAO address
@@ -51,8 +53,15 @@ from pathlib import Path
 
 log = logging.getLogger("heatmap")
 
-ASSET = "https://github.com/adsblol/globe_history_{year}/releases/download/{tag}/{tag}.tar.{part}"
-PART_NAMES = ("aa", "ab", "ac", "ad", "ae", "af")
+ASSET = "https://github.com/adsblol/globe_history_{year}/releases/download/{tag}/{tag}.tar{part}"
+PART_SUFFIXES = (".aa", ".ab", ".ac", ".ad", ".ae", ".af")
+# Tried in order; the first with a usable archive wins. prod-0 is the main aggregator and
+# staging-0 its twin; the rest are the names the same data was published under in other periods
+# (test-* Feb-Mar 2023, prod-1 Mar-Oct 2023, *tmp May-Jun 2025). mlatonly-0 is left out on
+# purpose: it holds MLAT positions only, so it would look like a day when almost nobody flew.
+INSTANCES = "prod-0,staging-0,prod-0tmp,staging-0tmp,prod-1,test-0,test-1"
+HEATMAP_FILE = re.compile(r"\./heatmap/(\d\d)\.bin\.ttf")
+WALK_CHUNK = 32768  # bytes fetched per step when walking tar headers
 UA = "adsb-day-activity/0.1 (ODbL archive reader)"
 GROUND = 0xFF85  # -123 as an unsigned 16-bit value
 SIGNED_URL_TTL = 240  # GitHub's redirect target is signed for ~5 minutes
@@ -95,19 +104,26 @@ class Archive:
         self._signed: dict[int, tuple[str, float]] = {}
         # Releases dated around 1 January can sit in the neighbouring year's repository.
         for year in (day.year, day.year - 1, day.year + 1):
-            for name in PART_NAMES:
-                url = ASSET.format(year=year, tag=self.tag, part=name)
-                status, _, final, headers = _open(url, 0, 1)
-                if status != 206:
-                    break
-                self.parts.append((url, int(headers["Content-Range"].rsplit("/", 1)[1])))
-                self._signed[len(self.parts) - 1] = (final, time.monotonic())
-            if self.parts:
+            if self._add_part(year, PART_SUFFIXES[0]):  # split archive (over 2 GB)
+                for suffix in PART_SUFFIXES[1:]:
+                    if not self._add_part(year, suffix):
+                        break
+                break
+            if self._add_part(year, ""):  # single .tar
                 break
         if not self.parts:
             raise NoRelease(self.tag)
         self.size = sum(s for _, s in self.parts)
         self.bytes_read = 0
+
+    def _add_part(self, year: int, suffix: str) -> bool:
+        url = ASSET.format(year=year, tag=self.tag, part=suffix)
+        status, _, final, headers = _open(url, 0, 1)
+        if status != 206:
+            return False
+        self.parts.append((url, int(headers["Content-Range"].rsplit("/", 1)[1])))
+        self._signed[len(self.parts) - 1] = (final, time.monotonic())
+        return True
 
     def read(self, offset: int, length: int) -> bytes:
         out = bytearray()
@@ -161,39 +177,71 @@ def _first_header(ar: Archive, offset: int, window: int) -> tuple[int, str, int]
     return None
 
 
+def _members(ar: Archive, offset: int):
+    """(header offset, name, size) of each tar member from `offset` to the end of the archive.
+
+    Fetches a chunk at a time, so a run of small members costs one request instead of one each."""
+    buf, base = b"", 0
+    while True:
+        if not base <= offset <= base + len(buf) - 512:
+            buf, base = ar.read(offset, WALK_CHUNK), offset
+        h = _tar_header(buf[offset - base : offset - base + 512])
+        if h is None:
+            return
+        yield offset, h[0], h[1]
+        offset += 512 + (h[1] + 511) // 512 * 512
+
+
+def _scan(ar: Archive, offset: int, *, through_traces: bool,
+          limit: int = 3000) -> tuple[dict[int, tuple[int, int]], int | None]:
+    """Walk members from `offset`, collecting {slice index: (data offset, size)} of heatmap files.
+
+    The second value is None when the walk ended by itself (past the heatmap directory, or at
+    the end of the archive). Otherwise it is the offset where the walk gave up: the first
+    `traces/` member when `through_traces` is false, or wherever `limit` members ran out.
+    """
+    slices: dict[int, tuple[int, int]] = {}
+    for n, (at, name, size) in enumerate(_members(ar, offset)):
+        m = HEATMAP_FILE.fullmatch(name)
+        if m:
+            slices[int(m.group(1))] = (at + 512, size)
+        elif slices and not name.startswith("./heatmap/"):
+            return slices, None
+        elif (name.startswith("./traces/") and not through_traces) or n >= limit:
+            return slices, at
+    return slices, None
+
+
 def locate_heatmap(ar: Archive) -> dict[int, tuple[int, int]]:
     """{slice index: (data offset, size)} for the heatmap files, found without reading the traces.
 
-    `traces/` comes first and is dense with headers; everything after it is a few large files. So
-    "does a window at this offset contain a traces header" is monotonic and can be binary-searched,
-    then the handful of remaining headers are walked one by one.
+    Each top-level directory is contiguous, but their order is not fixed. `traces/` is dense with
+    small members; everything else is a handful of files. So walk from the start: if the heatmap
+    comes before `traces/`, that walk finds it. Otherwise "a window at this offset contains a
+    traces header" is monotonic from the first traces member on, so the end of `traces/` is
+    binary-searched and the few members after it are walked.
     """
-    window, lo = 262144, 0
+    slices, traces_at = _scan(ar, 0, through_traces=False)
+    if slices:
+        return slices
+    if traces_at is None:
+        raise RuntimeError(f"{ar.tag}: neither heatmap nor traces found")
+    window, lo = 262144, traces_at
     for _ in range(4):  # widen the window if an unusually large trace file fooled a probe
-        hi, anchor = ar.size, None
+        hi = ar.size
         while hi - lo > window:
             mid = (lo + hi) // 2
             found = _first_header(ar, mid, window)
             if found and "/traces/" in found[1]:
-                lo, anchor = found[0], found[0]
+                lo = found[0]
             else:
                 hi = mid
-        offset = anchor if anchor is not None else lo // 512 * 512
-        members: dict[int, tuple[int, int]] = {}
-        for _ in range(400):
-            h = _tar_header(ar.read(offset, 512))
-            if h is None:
-                break
-            name, size = h
-            m = re.fullmatch(r"\./heatmap/(\d\d)\.bin\.ttf", name)
-            if m:
-                members[int(m.group(1))] = (offset + 512, size)
-            elif members:
-                return members  # past the heatmap directory
-            offset += 512 + (size + 511) // 512 * 512
-        if members:
-            return members
-        lo, window = offset, window * 4  # still inside traces: search again from here
+        slices, resume = _scan(ar, lo, through_traces=True)
+        if slices:
+            return slices
+        if resume is None:
+            break  # walked to the end of the archive: this day has no heatmap
+        lo, window = resume, window * 4  # still inside traces: search again from here
     raise RuntimeError(f"{ar.tag}: heatmap section not found")
 
 
@@ -221,16 +269,24 @@ def parse_slice(data: bytes, lo: int, hi: int, agg: dict[int, list], bit: int) -
 
 def fetch_day(day: dt.date, slices: list[int], *, instances: list[str], lo: int, hi: int,
               workers: int) -> tuple[dict, list[tuple]]:
-    """Read one day. Returns (meta, rows) with rows in COLUMNS order; writes nothing."""
-    ar = None
+    """Read one day from the first instance with a usable archive. Returns (meta, rows) with rows
+    in COLUMNS order; writes nothing. NoRelease if no instance published that day."""
+    error: Exception | None = None
     for inst in instances:
         try:
-            ar = Archive(day, inst)
-            break
+            return _read_archive(Archive(day, inst), day, slices, lo, hi, workers)
         except NoRelease:
             continue
-    if ar is None:
-        raise NoRelease(f"{day}: none of {instances}")
+        except Exception as e:  # broken or heatmap-less archive: the twin instance may be fine
+            log.warning("%s %s unusable (%s); trying the next instance", day, inst, e)
+            error = e
+    if error:
+        raise error
+    raise NoRelease(f"{day}: none of {instances}")
+
+
+def _read_archive(ar: Archive, day: dt.date, slices: list[int], lo: int, hi: int,
+                  workers: int) -> tuple[dict, list[tuple]]:
     t0 = time.monotonic()
     members = locate_heatmap(ar)
     t_locate = time.monotonic() - t0
@@ -296,7 +352,7 @@ def main(argv=None) -> int:
     ap.add_argument("--slices", default="all",
                     help='half-hours of the UTC day, e.g. "24-47,0-5" (default all 48)')
     ap.add_argument("--slice-step", type=int, default=1, help="take every Nth of the selected slices")
-    ap.add_argument("--instance", default="prod-0,staging-0", help="release instances to try, in order")
+    ap.add_argument("--instance", default=INSTANCES, help="release instances to try, in order")
     ap.add_argument("--hex-range", default="a00000-afffff", help="ICAO block to keep (default: United States)")
     ap.add_argument("--workers", type=int, default=3, help="parallel slice downloads")
     ap.add_argument("--out", type=Path, default=Path("out"), metavar="DIR",
